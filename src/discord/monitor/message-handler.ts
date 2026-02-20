@@ -6,7 +6,7 @@ import {
   resolveInboundDebounceMs,
 } from "../../auto-reply/inbound-debounce.js";
 import { clearSessionQueues } from "../../auto-reply/reply/queue.js";
-import { resolveStorePath, loadSessionStore } from "../../config/sessions.js";
+import { resolveStorePath, loadSessionStore, updateSessionStore } from "../../config/sessions.js";
 import { danger } from "../../globals.js";
 import type {
   DiscordMessageDeleteEvent,
@@ -33,6 +33,8 @@ type DiscordPendingMessage = {
   client: DiscordMessagePreflightParams["client"];
   revisions: string[];
   createdAt: number;
+  sessionKey?: string;
+  agentId?: string;
 };
 
 type DiscordConversationRun = {
@@ -198,6 +200,8 @@ function clonePendingMessage(entry: DiscordPendingMessage): DiscordPendingMessag
     client: entry.client,
     revisions: [...entry.revisions],
     createdAt: entry.createdAt,
+    sessionKey: entry.sessionKey,
+    agentId: entry.agentId,
   };
 }
 
@@ -398,6 +402,33 @@ function createInterruptMessageHandler(
     }
   };
 
+  const clearSessionForEntry = async (entry?: DiscordPendingMessage) => {
+    if (!entry?.sessionKey || !entry.agentId) {
+      return;
+    }
+    try {
+      const storePath = resolveStorePath(params.cfg.session?.store, {
+        agentId: entry.agentId,
+      });
+      const store = loadSessionStore(storePath);
+      const sessionEntry = store[entry.sessionKey] ?? store[entry.sessionKey.toLowerCase()];
+      const sessionId = sessionEntry?.sessionId;
+      clearSessionQueues([entry.sessionKey, sessionId]);
+      if (sessionId) {
+        abortEmbeddedPiRun(sessionId);
+      }
+      await updateSessionStore(storePath, (nextStore) => {
+        delete nextStore[entry.sessionKey!];
+        const lowerKey = entry.sessionKey!.toLowerCase();
+        if (lowerKey !== entry.sessionKey) {
+          delete nextStore[lowerKey];
+        }
+      });
+    } catch (err) {
+      params.runtime.error?.(danger(`discord delete session reset failed: ${String(err)}`));
+    }
+  };
+
   const scheduleRun = (state: DiscordConversationState, options?: { immediate?: boolean }) => {
     if (!state.needsRun || state.order.length === 0) {
       return;
@@ -459,6 +490,14 @@ function createInterruptMessageHandler(
       run.agentId = ctx.route.agentId;
 
       const ids = snapshot.map((entry) => entry.id);
+      for (const id of ids) {
+        const source = state.messages.get(id);
+        if (!source) {
+          continue;
+        }
+        source.sessionKey = ctx.route.sessionKey;
+        source.agentId = ctx.route.agentId;
+      }
       const requiresSyntheticSid =
         state.attempt > 1 || ids.length > 1 || snapshot.some((entry) => entry.revisions.length > 1);
       const messageSidOverride = requiresSyntheticSid
@@ -664,7 +703,8 @@ function createInterruptMessageHandler(
     if (!messageId) {
       return;
     }
-    const key = messageToConversationKey.get(messageId);
+    const recent = resolveRecentMessage(messageId);
+    const key = messageToConversationKey.get(messageId) ?? recent?.key;
     if (!key) {
       recentMessages.delete(messageId);
       return;
@@ -672,10 +712,13 @@ function createInterruptMessageHandler(
     const state = conversations.get(key);
     if (!state) {
       messageToConversationKey.delete(messageId);
+      await clearSessionForEntry(recent?.entry);
       recentMessages.delete(messageId);
       return;
     }
 
+    const removedEntry =
+      state.messages.get(messageId) ?? (recent ? clonePendingMessage(recent.entry) : undefined);
     removePendingMessage(state, messageId);
     if (state.timer) {
       clearTimeout(state.timer);
@@ -689,6 +732,7 @@ function createInterruptMessageHandler(
     if (state.order.length === 0) {
       state.needsRun = false;
       pruneConversation(state);
+      await clearSessionForEntry(removedEntry);
       return;
     }
 

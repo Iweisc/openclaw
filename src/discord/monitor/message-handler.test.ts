@@ -12,6 +12,18 @@ const resolveStorePath = vi.fn(() => "/tmp/openclaw-discord-message-handler-test
 const loadSessionStore = vi.fn(() => ({
   "agent:main:discord:channel:c1": { sessionId: "session-1" },
 }));
+const updateSessionStore = vi.fn(
+  async (
+    _storePath: string,
+    mutator: (store: Record<string, { sessionId: string }>) => Promise<void> | void,
+  ) => {
+    const store = {
+      "agent:main:discord:channel:c1": { sessionId: "session-1" },
+    };
+    await mutator(store);
+    return undefined;
+  },
+);
 
 vi.mock("./message-handler.preflight.js", () => ({
   preflightDiscordMessage,
@@ -35,6 +47,7 @@ vi.mock("../../config/sessions.js", async (importOriginal) => {
     ...actual,
     resolveStorePath,
     loadSessionStore,
+    updateSessionStore,
   };
 });
 
@@ -188,6 +201,13 @@ beforeEach(() => {
   resolveStorePath.mockClear();
   loadSessionStore.mockClear().mockReturnValue({
     "agent:main:discord:channel:c1": { sessionId: "session-1" },
+  });
+  updateSessionStore.mockReset().mockImplementation(async (_storePath, mutator) => {
+    const store = {
+      "agent:main:discord:channel:c1": { sessionId: "session-1" },
+    };
+    await mutator(store);
+    return undefined;
   });
 });
 
@@ -434,6 +454,32 @@ describe("createDiscordMessageHandler mutation interrupt toggle", () => {
       abortSignal?: AbortSignal;
     };
     expect(firstCall.abortSignal?.aborted).toBe(true);
+    expect(abortEmbeddedPiRun).toHaveBeenCalledWith("session-1");
+  });
+
+  it("clears persisted session state when a processed message is later deleted", async () => {
+    const { handler } = createHandler({ interruptOnMessageMutations: true });
+
+    await handler(
+      createMessageEvent({ id: "m1", content: "write a 300 word essay about apples" }) as never,
+      {} as never,
+    );
+    await vi.runAllTimersAsync();
+    expect(processDiscordMessage).toHaveBeenCalledTimes(1);
+
+    await handler.handleMessageDelete(createDeleteEvent("m1") as never, {} as never);
+    await vi.runAllTimersAsync();
+
+    expect(updateSessionStore).toHaveBeenCalledTimes(1);
+    const mutator = updateSessionStore.mock.calls[0]?.[1] as
+      | ((store: Record<string, { sessionId: string }>) => Promise<void> | void)
+      | undefined;
+    const probeStore = {
+      "agent:main:discord:channel:c1": { sessionId: "session-1" },
+    };
+    await mutator?.(probeStore);
+    expect(probeStore["agent:main:discord:channel:c1"]).toBeUndefined();
+    expect(clearSessionQueues).toHaveBeenCalled();
     expect(abortEmbeddedPiRun).toHaveBeenCalledWith("session-1");
   });
 });
